@@ -422,11 +422,11 @@ if __name__ == "__main__":
     arr: npt.NDArray[np.float32] = load_image("IMG_6081.png")
     print(f"original: {arr.shape}")
     # each pass removes paths until the cheapest one is no longer free
-    carved, col_removed, avgs = carve(arr, stop=0.05)
+    carved, col_removed, avgs = carve(arr, stop=0.075)
     print(f"removed {len(col_removed)} column paths -> {carved.shape}")
     if avgs:
         print(f"avg cost of removed paths: first {avgs[0]:.3g}, last {avgs[-1]:.3g}")
-    carved, row_removed, avgs = carve_rows(carved, stop=0.05)
+    carved, row_removed, avgs = carve_rows(carved, stop=0.075)
     print(f"removed {len(row_removed)} row paths -> {carved.shape}")
     if avgs:
         print(f"avg cost of removed paths: first {avgs[0]:.3g}, last {avgs[-1]:.3g}")
