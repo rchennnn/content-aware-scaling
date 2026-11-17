@@ -9,7 +9,7 @@ This project is a small, from-scratch implementation of seam carving, the techni
 
 ## Where did the pixels go?
 
-Looking at the two images above, it is fair to wonder whether the carver did anything cleverer than crop the frame. The clearest way to check is to look directly at what was taken out. As the carver works, it records every path it removes, and once it finishes those paths are mapped back onto the original photograph and painted flat grey.
+Looking at the two images above, it is fair to wonder whether the carver did anything cleverer than crop the frame. The clearest way to check is to look directly at what was taken out. As the carver works, it records every path it removes, and once it finishes those paths are mapped back onto the original photograph and painted flat grey. Thus the carver functions as a "compressor". It removes pixels in a pathwise fashion and shrinks the image down.
 
 ![Removed pixels greyed out on the original image](removed.png)
 
