@@ -2,9 +2,17 @@
 
 This project is a small, from-scratch implementation of seam carving, the technique that lets you shrink an image without simply squashing it or cropping off its edges. Instead of scaling every pixel equally, seam carving looks for the parts of the picture that nobody will miss, such as stretches of clear sky, blank walls, or smooth gradients, and quietly removes them one thin line at a time. The interesting content stays intact while the empty space around it collapses.
 
-| Original (4032 × 3024) | Carved (3978 × 1249) |
+| Original (4032 × 3024) | Carved (4032 × 2387) |
 | :---: | :---: |
 | ![Original image](IMG_6081.png) | ![Carved image](carved.png) |
+
+## Did it just crop the top?
+
+Since this run removed only rows, it is fair to wonder whether the carver simply trimmed the sky off the top. One way to check is to line the two images up along their bottom edges and subtract them. If the carved image were nothing more than a crop, every pixel would match its counterpart in the original and the difference would be completely black. The image below shows that difference, averaged across the colour channels and rescaled so that the largest difference is white.
+
+![Difference between the original and carved images, aligned at the bottom](diff.png)
+
+The bottom of the frame is almost black, because the carver removed very little there and the two images still agree. Moving upward, the floating log turns into a pair of bright outlines, a sign that it has slipped a little further out of place with every row the carver took from the water beneath it. By the time we reach the bridge and the city, everything is bright, because those buildings now sit hundreds of rows lower than they did in the original. The sky stays dark not because it was left alone, but because one patch of smooth blue looks much like another even after it has shifted. Taken together, the picture shows that rows were removed throughout the water and sky rather than cut from a single band at the top. You can regenerate it at any time by running `uv run python diff_images.py`, which writes `diff.png`.
 
 ## How it works
 
@@ -52,4 +60,4 @@ If you would rather stop after a fixed number of seams regardless of their cost,
 
 ## Project layout
 
-Nearly all of the work happens in `parse_image.py`, which contains the image loading and saving helpers, the distance calculations, the seam finding, and the carving loop itself. It also includes `find_min_paths_from_each_start`, an alternative that computes the best seam beginning at every column of the top row in a single pass; it isn't used by the main carving loop, but it can be useful for exploring the structure of an image.
+Nearly all of the work happens in `parse_image.py`, which contains the image loading and saving helpers, the distance calculations, the seam finding, and the carving loop itself. It also includes `find_min_paths_from_each_start`, an alternative that computes the best seam beginning at every column of the top row in a single pass; it isn't used by the main carving loop, but it can be useful for exploring the structure of an image. The small `diff_images.py` script produces the bottom-aligned difference image shown above.
