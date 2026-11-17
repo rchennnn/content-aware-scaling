@@ -5,7 +5,7 @@ This project is a small, from-scratch implementation of seam carving, the techni
 | Original (4032 × 3024) | Carved (3421 × 1585) |
 | :---: | :---: |
 | ![Original image](IMG_6081.png) | ![Carved image](carved.png) |
-| Taken on iPhone X 2023/09/08 12:01:48 at 50°05'04.4"N 14°24'48.2"E | | 
+| Taken on iPhone X 2023/09/08 12:01:48 at 50°05'04.4"N 14°24'48.2"E (accurate within 100m) | | 
 
 ## Where did the pixels go?
 
