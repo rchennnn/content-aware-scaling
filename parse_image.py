@@ -12,19 +12,6 @@ def load_image(path: str) -> npt.NDArray[np.float32]:
     arr: npt.NDArray[np.float32] = arr.astype(np.float32) / 256
     return arr.transpose(2, 0, 1)                       # (3, H, W)
 
-def get_neighbors(r, c, min_h, max_h, min_w, max_w):
-    dirs = [(-1, 0), (-1, 1), (-1, -1), (0, 1), (0, -1), (1, 1), (1, 0), (1, -1)]
-    neighbors = []
-    for d in dirs:
-        new_r = r + d[0]
-        new_c = c + d[1]
-        if new_r < min_h or new_r >= max_h:
-            continue
-        if new_c < min_w or new_c >= max_w:
-            continue
-        neighbors.append((new_r, new_c))
-    return neighbors
-
 def get_distance(my_vec, neighbor_vec): 
     bcast_diff = (my_vec - neighbor_vec)**2
     row_sums = bcast_diff.sum(axis=1)
@@ -48,22 +35,90 @@ def get_distance_matrix(image: npt.NDArray[np.float32]) -> npt.NDArray[np.float3
     return total / count
 
 
-def find_min_path(distance_matrix: npt.NDArray[np.float32]) -> tuple[list[int], float]:
+def luminance(image: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
+    """(3, H, W) RGB -> (H, W) perceived brightness."""
+    return (0.299 * image[0] + 0.587 * image[1] + 0.114 * image[2]).astype(np.float32)
+
+
+@njit(cache=True)
+def _local_mad(values: npt.NDArray[np.float32], radius: int) -> npt.NDArray[np.float32]:
+    """Median absolute deviation over a (2*radius+1)^2 window around each
+    pixel, with the window clipped at the borders."""
+    height, width = values.shape
+    out: npt.NDArray[np.float32] = np.empty((height, width), dtype=np.float32)
+    buf: npt.NDArray[np.float32] = np.empty((2 * radius + 1) ** 2, dtype=np.float32)
+    for r in range(height):
+        r0, r1 = max(0, r - radius), min(height, r + radius + 1)
+        for c in range(width):
+            c0, c1 = max(0, c - radius), min(width, c + radius + 1)
+            n: int = 0
+            for i in range(r0, r1):
+                for j in range(c0, c1):
+                    buf[n] = values[i, j]
+                    n += 1
+            window = buf[:n]
+            m = np.median(window)
+            out[r, c] = np.median(np.abs(window - m))
+    return out
+
+
+def variability_map(
+    image: npt.NDArray[np.float32], radius: int = 7, stride: int = 4
+) -> npt.NDArray[np.float32]:
+    """Robust local variability of each pixel's neighbourhood, as a (H, W) map
+    on the same scale as a standard deviation.
+
+    Uses horizontal neighbour differences of the brightness rather than the
+    brightness itself, so a smooth gradient (constant differences) scores ~0,
+    texture (differences that jump around) scores high, and a single sharp
+    edge is an outlier the median ignores.
+
+    For speed the differences are sampled every `stride` pixels, the MAD is
+    taken over a (2*radius+1)^2 window on that grid (so it spans about
+    (2*radius+1)*stride original pixels), and the result is scaled back up.
+    """
+    _, height, width = image.shape
+    gray: npt.NDArray[np.float32] = luminance(image)
+    diffs: npt.NDArray[np.float32] = np.empty_like(gray)
+    diffs[:, :-1] = gray[:, 1:] - gray[:, :-1]
+    diffs[:, -1] = diffs[:, -2]
+    small: npt.NDArray[np.float32] = _local_mad(np.ascontiguousarray(diffs[::stride, ::stride]), radius)
+    full: npt.NDArray[np.float32] = np.repeat(np.repeat(small, stride, axis=0), stride, axis=1)
+    return 1.4826 * full[:height, :width]
+
+
+def find_min_path(
+    distance_matrix: npt.NDArray[np.float32], step_penalty: float = 0.0
+) -> tuple[list[int], float]:
     """Top-to-bottom path (one column per row, each step moves col by -1/0/+1)
     with the least average distance. Returns (cols, avg) where cols[r] is the
     column at row r. Every path has length H, so min average == min sum.
 
-    DP: cost[r, c] = distance_matrix[r, c] + min(cost[r-1, c-1 : c+2])
+    DP: cost[r, c] = distance_matrix[r, c] + min(cost[r-1, c-1] + step_penalty,
+                                                 cost[r-1, c],
+                                                 cost[r-1, c+1] + step_penalty)
+
+    step_penalty makes every diagonal step cost extra, so paths run straight
+    unless bending saves more than the penalty. In smooth gradients this keeps
+    neighbouring columns losing the same row, so the gradient stays aligned
+    instead of shifting where many paths detour around the same object.
+    The returned avg is the mean distance of the chosen pixels only (penalties
+    excluded), so the threshold keeps the same meaning whatever the penalty.
     """
-    path, total = _min_path_dp(np.ascontiguousarray(distance_matrix, dtype=np.float64))
+    path, total = _min_path_dp(
+        np.ascontiguousarray(distance_matrix, dtype=np.float64), step_penalty
+    )
     cols: list[int] = path.tolist()
     avg: float = float(total / distance_matrix.shape[0])
     return cols, avg
 
 
 @njit(cache=True)
-def _min_path_dp(dist: npt.NDArray[np.float64]) -> tuple[npt.NDArray[np.int64], float]:
-    """Compiled DP + backtrack. Returns (cols, total_cost).
+def _min_path_dp(
+    dist: npt.NDArray[np.float64], step_penalty: float
+) -> tuple[npt.NDArray[np.int64], float]:
+    """Compiled DP + backtrack. Returns (cols, total_distance), where
+    total_distance sums dist along the path without the step penalties.
     Ties prefer upper-left, then up, then upper-right; last row takes the
     leftmost minimum."""
     height, width = dist.shape
@@ -75,12 +130,12 @@ def _min_path_dp(dist: npt.NDArray[np.float64]) -> tuple[npt.NDArray[np.int64], 
         for c in range(width):
             best_c: int = c
             best: float = cost[r - 1, c]
-            if c > 0 and cost[r - 1, c - 1] <= best:   # left wins ties
+            if c > 0 and cost[r - 1, c - 1] + step_penalty <= best:   # left wins ties
                 best_c = c - 1
-                best = cost[r - 1, c - 1]
-            if c < width - 1 and cost[r - 1, c + 1] < best:
+                best = cost[r - 1, c - 1] + step_penalty
+            if c < width - 1 and cost[r - 1, c + 1] + step_penalty < best:
                 best_c = c + 1
-                best = cost[r - 1, c + 1]
+                best = cost[r - 1, c + 1] + step_penalty
             cost[r, c] = dist[r, c] + best
             parent[r, c] = best_c
 
@@ -92,7 +147,10 @@ def _min_path_dp(dist: npt.NDArray[np.float64]) -> tuple[npt.NDArray[np.int64], 
     path[height - 1] = end
     for r in range(height - 1, 0, -1):
         path[r - 1] = parent[r, path[r]]
-    return path, cost[height - 1, end]
+    total: float = 0.0
+    for r in range(height):
+        total += dist[r, path[r]]
+    return path, total
 
 
 def find_min_paths_from_each_start(
@@ -186,10 +244,22 @@ def carve(
     max_paths: int | None = None,
     verbose: bool = True,
     band: int = 3,
+    mad_radius: int = 7,
+    mad_stride: int = 4,
+    mad_floor: float = 1 / 256,
+    step_penalty: float = 0.0,
 ) -> tuple[npt.NDArray[np.float32], list[list[int]], list[float]]:
     """Repeatedly find the least-average-distance top-to-bottom path, remove
     it, and stitch the image back together. Stops when the best path's average
     distance is >= threshold (or after max_paths removals, or width hits 1).
+
+    Each pixel's distance is divided by sigma^2 + mad_floor^2, where sigma is
+    the robust local variability from variability_map. The score is therefore
+    relative ("how unusual is this difference for its surroundings?"), so the
+    threshold is unitless rather than a raw squared colour difference.
+    mad_floor (one 8-bit brightness level by default) keeps perfectly flat
+    regions from dividing by zero. step_penalty is passed to find_min_path to
+    discourage diagonal steps; it is in the same units as the scaled distances.
 
     Returns (carved_image, removed_paths, removed_avgs). Each removed path's
     columns are in the coordinates of the image at the time it was removed.
@@ -202,18 +272,25 @@ def carve(
     height: int = image.shape[1]
     offsets: npt.NDArray[np.int64] = np.arange(-band, band + 1)
     band_rows: npt.NDArray[np.int64] = np.repeat(np.arange(height), len(offsets))
-    dist: npt.NDArray[np.float32] = get_distance_matrix(image)  # full compute once
+    # variability is a property of the region, so compute it once and carve
+    # it alongside the image instead of recomputing it every iteration
+    sigma: npt.NDArray[np.float32] = variability_map(image, mad_radius, mad_stride)
+    denom: npt.NDArray[np.float32] = (sigma ** 2 + mad_floor ** 2).astype(np.float32)
+    dist: npt.NDArray[np.float32] = get_distance_matrix(image) / denom  # full compute once
     while image.shape[2] > 1 and (max_paths is None or len(removed_paths) < max_paths):
-        cols, avg = find_min_path(dist)
+        cols, avg = find_min_path(dist, step_penalty)
         if avg >= threshold:
             break
         image = remove_path(image, cols)
         dist = remove_path(dist, cols)
+        denom = remove_path(denom, cols)
         # only pixels within +/- band columns of the removed path changed neighbors
         band_cols: npt.NDArray[np.int64] = (
             np.asarray(cols)[:, None] + offsets
         ).clip(0, image.shape[2] - 1).ravel()
-        dist[band_rows, band_cols] = compute_distance_at(image, band_rows, band_cols)
+        dist[band_rows, band_cols] = (
+            compute_distance_at(image, band_rows, band_cols) / denom[band_rows, band_cols]
+        )
         removed_paths.append(cols)
         removed_avgs.append(avg)
         pbar.update(1)
@@ -228,16 +305,24 @@ def carve_rows(
     max_paths: int | None = None,
     verbose: bool = True,
     band: int = 3,
+    mad_radius: int = 7,
+    mad_stride: int = 4,
+    mad_floor: float = 1 / 256,
+    step_penalty: float = 0.0,
 ) -> tuple[npt.NDArray[np.float32], list[list[int]], list[float]]:
     """Same as carve, but removes left-to-right paths (one row per column,
     each step moves row by -1/0/+1), shrinking the height.
 
-    Implemented by transposing H and W, carving, and transposing back.
+    Implemented by transposing H and W, carving, and transposing back. Because
+    of the transpose, the variability map is built from vertical differences.
     Returns (carved_image, removed_paths, removed_avgs) where removed_paths[k][c]
     is the row removed at column c for the k-th path.
     """
     transposed: npt.NDArray[np.float32] = image.transpose(0, 2, 1)  # (3, W, H)
-    carved_t, removed_paths, removed_avgs = carve(transposed, threshold, max_paths, verbose, band)
+    carved_t, removed_paths, removed_avgs = carve(
+        transposed, threshold, max_paths, verbose, band, mad_radius, mad_stride, mad_floor,
+        step_penalty,
+    )
     carved: npt.NDArray[np.float32] = carved_t.transpose(0, 2, 1)   # back to (3, H', W)
     return carved, removed_paths, removed_avgs
 
@@ -250,7 +335,7 @@ def save_image(image: npt.NDArray[np.float32], path: str) -> None:
 
 if __name__ == "__main__":
     arr: npt.NDArray[np.float32] = load_image("IMG_6081.png")
-    THRESHOLD=1e-3
+    THRESHOLD=1
     print(f"original: {arr.shape}")
     carved, removed, avgs = carve(arr, threshold=THRESHOLD)
     print(f"removed {len(removed)} column paths -> {carved.shape}")
