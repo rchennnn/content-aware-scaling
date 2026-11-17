@@ -11,7 +11,7 @@ This project is a small, from-scratch implementation of seam carving, the techni
 
 Looking at the two images above, it is fair to wonder whether the carver did anything cleverer than crop the frame. The clearest way to check is to look directly at what was taken out. As the carver works, it records every path it removes, and once it finishes those paths are mapped back onto the original photograph and painted flat grey. Thus the carver functions as a "compressor". It removes pixels in a pathwise fashion and shrinks the image down.
 
-The tree, water, and sky all have redundant pixels, that is if we remove them, a viewer would hardly notice. Also buildings have redundant pixels if they display a monochrome and mono-texture wall as we can see in Bedřich Smetana Museum, Lichtenštejnský palác, and bits of Pražský hrad and Karlův most.
+The tree, water, and sky all have redundant pixels, that is if we remove them, a viewer would hardly notice. Also buildings have redundant pixels if they display a monochrome and mono-texture wall as we can see in Muzeum Bedřicha Smetany (right), Lichtenštejnský palác (left on river bank), and bits of Pražský hrad (center top) and Karlův most (center).
 
 ![Removed pixels greyed out on the original image](removed.png)
 
