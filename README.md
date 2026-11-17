@@ -48,4 +48,4 @@ If you would rather stop after a fixed number of seams regardless of their cost,
 
 ## Project layout
 
-Nearly all of the work happens in `parse_image.py`, which contains the image loading and saving helpers, the distance calculations, the seam finding, and the carving loop itself. It also includes `find_min_paths_from_each_start`, an alternative that computes the best seam beginning at every column of the top row in a single pass; it isn't used by the main carving loop, but it can be useful for exploring the structure of an image. The `main.py` file is just a placeholder for now.
+Nearly all of the work happens in `parse_image.py`, which contains the image loading and saving helpers, the distance calculations, the seam finding, and the carving loop itself. It also includes `find_min_paths_from_each_start`, an alternative that computes the best seam beginning at every column of the top row in a single pass; it isn't used by the main carving loop, but it can be useful for exploring the structure of an image.
