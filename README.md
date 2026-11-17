@@ -8,15 +8,11 @@ This project is a small, from-scratch implementation of seam carving, the techni
 
 ## Where did the pixels go?
 
-Looking at the two images above, it is fair to wonder whether the carver did anything cleverer than crop the frame. There are two ways to check. The first is to look directly at what was taken out: as the carver works, it records every path it removes, and once it finishes those paths are mapped back onto the original photograph and painted flat grey. The second is to line the carved image up with the original along their bottom-left corners and subtract them. If the carved image were nothing more than a crop, every pixel would match its counterpart and the difference would be completely black. The two views are shown side by side below, with the difference averaged across the colour channels and rescaled so that the largest difference is white.
+Looking at the two images above, it is fair to wonder whether the carver did anything cleverer than crop the frame. The clearest way to check is to look directly at what was taken out. As the carver works, it records every path it removes, and once it finishes those paths are mapped back onto the original photograph and painted flat grey.
 
-| Removed pixels, greyed out on the original | Difference, aligned at the bottom |
-| :---: | :---: |
-| ![Removed pixels greyed out on the original image](removed.png) | ![Difference between the original and carved images, aligned at the bottom](diff.png) |
+![Removed pixels greyed out on the original image](removed.png)
 
-The greyed-out image answers the question most directly. In this run the carver removed 958 vertical paths and 1,581 horizontal ones, which together account for nearly two thirds of the original pixels, and they are spread across the whole frame rather than taken from its edges. The sky is almost entirely gone, and the river is covered in a fine net of removed paths, because joins between ripples look just like more ripples. The paths flow around the floating log rather than through it, and they largely leave the bridge, the city, and the reflection of the building on the right alone, threading between them through trees and gaps where they can.
-
-The difference image tells the same story from the other side. Because the carver removed columns as well as rows, nothing lines up for long: the log appears twice, once where it sits in the original and once where it ended up after the water around it was thinned out, and the city shows as a bright ghost of itself because every building has moved. A crop would have produced a black image; this one is full of displaced structure. Running `uv run python parse_image.py` writes both `carved.png` and `removed.png`, and running `uv run python diff_images.py` afterwards regenerates `diff.png`.
+In this run the carver removed 958 vertical paths and 1,581 horizontal ones, which together account for nearly two thirds of the original pixels, and they are spread across the whole frame rather than taken from its edges. The sky is almost entirely gone, and the river is covered in a fine net of removed paths, because joins between ripples look just like more ripples. The paths flow around the floating log rather than through it, and they largely leave the bridge, the city, and the reflection of the building on the right alone, threading between them through trees and gaps where they can. Running `uv run python parse_image.py` writes both `carved.png` and `removed.png`.
 
 ## How it works
 
@@ -64,4 +60,4 @@ If you would rather stop after a fixed number of seams regardless of their cost,
 
 ## Project layout
 
-Nearly all of the work happens in `parse_image.py`, which contains the image loading and saving helpers, the variability estimate, the forward-energy seam search, and the carving loop itself. The same file maps the removed paths back onto the original to produce `removed.png`. It also includes `find_min_paths_from_each_start`, which computes the best seam beginning at every column of the top row in a single pass over any cost matrix; it isn't used by the main carving loop, but it can be useful for exploring the structure of an image. The small `diff_images.py` script produces the bottom-aligned difference image shown above.
+Nearly all of the work happens in `parse_image.py`, which contains the image loading and saving helpers, the variability estimate, the forward-energy seam search, and the carving loop itself. The same file maps the removed paths back onto the original to produce `removed.png`. It also includes `find_min_paths_from_each_start`, which computes the best seam beginning at every column of the top row in a single pass over any cost matrix; it isn't used by the main carving loop, but it can be useful for exploring the structure of an image.
