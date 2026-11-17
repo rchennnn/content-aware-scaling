@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import numpy.typing as npt
 from PIL import Image
@@ -11,29 +13,6 @@ def load_image(path: str) -> npt.NDArray[np.float32]:
     arr: npt.NDArray[np.uint8] = np.asarray(img)       # (H, W, 3)
     arr: npt.NDArray[np.float32] = arr.astype(np.float32) / 256
     return arr.transpose(2, 0, 1)                       # (3, H, W)
-
-def get_distance(my_vec, neighbor_vec): 
-    bcast_diff = (my_vec - neighbor_vec)**2
-    row_sums = bcast_diff.sum(axis=1)
-    avg_dist = np.mean(row_sums)
-    return avg_dist
-    
-
-DIRS = [(-1, 0), (-1, 1), (-1, -1), (0, 1), (0, -1), (1, 1), (1, 0), (1, -1)]
-
-def get_distance_matrix(image: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
-    _, height, width = image.shape
-    total: npt.NDArray[np.float32] = np.zeros((height, width), dtype=np.float32)
-    count: npt.NDArray[np.float32] = np.zeros((height, width), dtype=np.float32)
-    for dr, dc in DIRS:
-        # pixels whose neighbor (r+dr, c+dc) is inside the image
-        r0, r1 = max(0, -dr), height - max(0, dr)
-        c0, c1 = max(0, -dc), width - max(0, dc)
-        diff = image[:, r0:r1, c0:c1] - image[:, r0 + dr:r1 + dr, c0 + dc:c1 + dc]
-        total[r0:r1, c0:c1] += (diff ** 2).sum(axis=0)
-        count[r0:r1, c0:c1] += 1
-    return total / count
-
 
 def luminance(image: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
     """(3, H, W) RGB -> (H, W) perceived brightness."""
@@ -88,56 +67,88 @@ def variability_map(
 
 
 def find_min_path(
-    distance_matrix: npt.NDArray[np.float32], step_penalty: float = 0.0
+    image: npt.NDArray[np.float32],
+    inv_scale: npt.NDArray[np.float32],
+    step_penalty: float = 0.0,
 ) -> tuple[list[int], float]:
     """Top-to-bottom path (one column per row, each step moves col by -1/0/+1)
-    with the least average distance. Returns (cols, avg) where cols[r] is the
-    column at row r. Every path has length H, so min average == min sum.
+    whose removal leaves the least visible joins. Returns (cols, avg) where
+    cols[r] is the column at row r and avg is the path's mean cost per row.
 
-    DP: cost[r, c] = distance_matrix[r, c] + min(cost[r-1, c-1] + step_penalty,
-                                                 cost[r-1, c],
-                                                 cost[r-1, c+1] + step_penalty)
+    Costs use forward energy: instead of asking how busy the removed pixels
+    were, we ask how different the pixels are that become neighbours once
+    they are gone. Removing (r, c) makes (r, c-1) and (r, c+1) adjacent, and
+    arriving diagonally also makes (r-1, c) adjacent to (r, c-1) or (r, c+1).
 
-    step_penalty makes every diagonal step cost extra, so paths run straight
-    unless bending saves more than the penalty. In smooth gradients this keeps
-    neighbouring columns losing the same row, so the gradient stays aligned
-    instead of shifting where many paths detour around the same object.
-    The returned avg is the mean distance of the chosen pixels only (penalties
-    excluded), so the threshold keeps the same meaning whatever the penalty.
+    Each such join is scored as z = colour mismatch / local variability
+    (inv_scale holds 1 / variability), and only the part beyond natural
+    variation counts: cost = max(0, z - 1). A join that looks like the
+    texture already around it is free, so paths can run through rippling
+    water or smooth sky at no cost, while sharp edges stay expensive.
+
+    step_penalty optionally adds a fixed charge to every diagonal step. The
+    returned avg excludes it, so the threshold means the same with or without.
     """
-    path, total = _min_path_dp(
-        np.ascontiguousarray(distance_matrix, dtype=np.float64), step_penalty
+    path, total = _min_path_forward(
+        np.ascontiguousarray(image), np.ascontiguousarray(inv_scale), step_penalty
     )
-    cols: list[int] = path.tolist()
-    avg: float = float(total / distance_matrix.shape[0])
-    return cols, avg
+    return path.tolist(), float(total / image.shape[1])
 
 
-@njit(cache=True)
-def _min_path_dp(
-    dist: npt.NDArray[np.float64], step_penalty: float
+@njit(cache=True, fastmath=True, error_model="numpy")
+def _join_cost(
+    image: npt.NDArray[np.float32], inv: float, r1: int, c1: int, r2: int, c2: int
+) -> float:
+    """max(0, z - 1) for the join between pixels (r1, c1) and (r2, c2), where z
+    is their RMS colour difference across the three channels times inv
+    (1 / variability)."""
+    d0 = image[0, r1, c1] - image[0, r2, c2]
+    d1 = image[1, r1, c1] - image[1, r2, c2]
+    d2 = image[2, r1, c1] - image[2, r2, c2]
+    z = np.sqrt((d0 * d0 + d1 * d1 + d2 * d2) * np.float32(1.0 / 3.0)) * inv
+    return z - 1.0 if z > 1.0 else 0.0
+
+
+@njit(cache=True, fastmath=True, error_model="numpy")
+def _min_path_forward(
+    image: npt.NDArray[np.float32], inv_scale: npt.NDArray[np.float32], step_penalty: float
 ) -> tuple[npt.NDArray[np.int64], float]:
-    """Compiled DP + backtrack. Returns (cols, total_distance), where
-    total_distance sums dist along the path without the step penalties.
+    """Compiled forward-energy DP + backtrack. Returns (cols, total_cost), where
+    total_cost sums the join costs along the path without step penalties.
     Ties prefer upper-left, then up, then upper-right; last row takes the
-    leftmost minimum."""
-    height, width = dist.shape
+    leftmost minimum. At the borders, a missing neighbour falls back to the
+    pixel itself, so removing an edge pixel costs its ordinary neighbour
+    difference rather than nothing."""
+    _, height, width = image.shape
     cost: npt.NDArray[np.float64] = np.empty((height, width), dtype=np.float64)
     parent: npt.NDArray[np.int64] = np.empty((height, width), dtype=np.int64)
-    for c in range(width):
-        cost[0, c] = dist[0, c]
-    for r in range(1, height):
+    step: npt.NDArray[np.float64] = np.empty((height, width), dtype=np.float64)
+    for r in range(height):
         for c in range(width):
+            inv: float = inv_scale[r, c]
+            left: int = c - 1 if c > 0 else c
+            right: int = c + 1 if c < width - 1 else c
+            cu: float = _join_cost(image, inv, r, left, r, right)
+            if r == 0:
+                cost[r, c] = cu
+                step[r, c] = cu
+                continue
             best_c: int = c
-            best: float = cost[r - 1, c]
-            if c > 0 and cost[r - 1, c - 1] + step_penalty <= best:   # left wins ties
-                best_c = c - 1
-                best = cost[r - 1, c - 1] + step_penalty
-            if c < width - 1 and cost[r - 1, c + 1] + step_penalty < best:
-                best_c = c + 1
-                best = cost[r - 1, c + 1] + step_penalty
-            cost[r, c] = dist[r, c] + best
+            best_step: float = cu
+            best: float = cost[r - 1, c] + cu
+            if c > 0:
+                cl: float = cu + _join_cost(image, inv, r - 1, c, r, c - 1)
+                v: float = cost[r - 1, c - 1] + cl + step_penalty
+                if v <= best:   # left wins ties
+                    best_c, best, best_step = c - 1, v, cl
+            if c < width - 1:
+                cr: float = cu + _join_cost(image, inv, r - 1, c, r, c + 1)
+                v = cost[r - 1, c + 1] + cr + step_penalty
+                if v < best:
+                    best_c, best, best_step = c + 1, v, cr
+            cost[r, c] = best
             parent[r, c] = best_c
+            step[r, c] = best_step
 
     end: int = 0
     for c in range(1, width):
@@ -149,7 +160,7 @@ def _min_path_dp(
         path[r - 1] = parent[r, path[r]]
     total: float = 0.0
     for r in range(height):
-        total += dist[r, path[r]]
+        total += step[r, path[r]]
     return path, total
 
 
@@ -218,97 +229,134 @@ def _remove_path_kernel(
     return out
 
 
-def compute_distance_at(
-    image: npt.NDArray[np.float32],
-    rows: npt.NDArray[np.int64],
-    cols: npt.NDArray[np.int64],
-) -> npt.NDArray[np.float32]:
-    """Same per-pixel value as get_distance_matrix, but only at the given
-    (rows[i], cols[i]) coordinates."""
-    _, height, width = image.shape
-    total: npt.NDArray[np.float32] = np.zeros(rows.shape, dtype=np.float32)
-    count: npt.NDArray[np.float32] = np.zeros(rows.shape, dtype=np.float32)
-    for dr, dc in DIRS:
-        nr: npt.NDArray[np.int64] = rows + dr
-        nc: npt.NDArray[np.int64] = cols + dc
-        valid: npt.NDArray[np.bool_] = (nr >= 0) & (nr < height) & (nc >= 0) & (nc < width)
-        diff: npt.NDArray[np.float32] = image[:, rows[valid], cols[valid]] - image[:, nr[valid], nc[valid]]
-        total[valid] += (diff ** 2).sum(axis=0)
-        count[valid] += 1
-    return total / count
+# Expected cost of a single join between two pixels of ordinary texture.
+# If a join's z (colour difference / local variability) behaves like the
+# absolute value of a standard normal variable, then
+#     E[max(0, |Z| - 1)] = 2 * (phi(1) - (1 - Phi(1))) ~= 0.167,
+# where phi and Phi are the standard normal density and CDF. A path whose
+# average cost per row is at or below this leaves joins no more unusual than
+# the texture already around them, so removing it is effectively free. This
+# number comes from the cost's definition, not from tuning.
+FREE_COST: float = 2.0 * (
+    math.exp(-0.5) / math.sqrt(2.0 * math.pi) - 0.5 * math.erfc(1.0 / math.sqrt(2.0))
+)
+
+
+def find_elbow(costs: list[float]) -> int:
+    """Given the cost of each removed path in order, return how many of them
+    to keep: the point where removals stop being cheap and start to climb.
+
+    Works on the cumulative cost, which rises slowly while the carver eats
+    filler and steeply once only content is left. After scaling both axes to
+    [0, 1], the elbow is the point that sits furthest below the straight line
+    from the first point to the last. Equivalently, it is where a single
+    path's cost first overtakes the average cost of all the paths tried, so
+    it needs no threshold, only the curve's own shape. Using the cumulative
+    cost rather than the raw per-path costs makes it robust to noise.
+    """
+    n: int = len(costs)
+    if n == 0:
+        return 0
+    cumulative: npt.NDArray[np.float64] = np.cumsum(np.asarray(costs, dtype=np.float64))
+    if cumulative[-1] <= 0:
+        return n  # every path was free, so keep them all
+    x: npt.NDArray[np.float64] = np.arange(1, n + 1) / n
+    y: npt.NDArray[np.float64] = cumulative / cumulative[-1]
+    return int(np.argmax(x - y)) + 1
 
 
 def carve(
     image: npt.NDArray[np.float32],
-    threshold: float,
+    stop: str | float = "free",
     max_paths: int | None = None,
     verbose: bool = True,
-    band: int = 3,
     mad_radius: int = 7,
     mad_stride: int = 4,
     mad_floor: float = 1 / 256,
     step_penalty: float = 0.0,
+    min_keep: float = 0.25,
 ) -> tuple[npt.NDArray[np.float32], list[list[int]], list[float]]:
-    """Repeatedly find the least-average-distance top-to-bottom path, remove
-    it, and stitch the image back together. Stops when the best path's average
-    distance is >= threshold (or after max_paths removals, or width hits 1).
+    """Repeatedly find the top-to-bottom path whose removal leaves the least
+    visible joins (see find_min_path), remove it, and stitch the image back
+    together. `stop` decides when to finish:
 
-    Each pixel's distance is divided by sigma^2 + mad_floor^2, where sigma is
-    the robust local variability from variability_map. The score is therefore
-    relative ("how unusual is this difference for its surroundings?"), so the
-    threshold is unitless rather than a raw squared colour difference.
-    mad_floor (one 8-bit brightness level by default) keeps perfectly flat
-    regions from dividing by zero. step_penalty is passed to find_min_path to
-    discourage diagonal steps; it is in the same units as the scaled distances.
+    "free" (default): stop as soon as the cheapest remaining path is no
+        longer free, meaning its average cost per row exceeds FREE_COST, the
+        cost of an ordinary join inside natural texture. Everything nobody
+        would notice is removed, and nothing more.
+    "elbow": keep removing paths until only min_keep of the width is left,
+        use find_elbow on the recorded costs to pick the point where removals
+        start to get expensive, and rewind to it by replaying just those
+        removals on the original image. min_keep only limits how far the
+        search goes; it matters only if the elbow is never reached.
+    a number: stop as soon as the best path's average cost reaches it.
+
+    In every mode the carver also stops after max_paths removals, or when the
+    width would drop to 1.
+
+    Each join is measured against sigma, the robust local variability from
+    variability_map, floored at mad_floor (one 8-bit brightness level by
+    default) so perfectly flat regions never divide by zero. step_penalty is
+    passed to find_min_path to discourage diagonal steps.
 
     Returns (carved_image, removed_paths, removed_avgs). Each removed path's
     columns are in the coordinates of the image at the time it was removed.
     """
+    original: npt.NDArray[np.float32] = image
     removed_paths: list[list[int]] = []
     removed_avgs: list[float] = []
-    # total is an upper bound; the threshold usually stops it earlier
-    limit: int = image.shape[2] - 1 if max_paths is None else min(max_paths, image.shape[2] - 1)
+    if stop == "free":
+        threshold: float | None = FREE_COST
+    elif stop == "elbow":
+        threshold = None
+    elif isinstance(stop, (int, float)):
+        threshold = float(stop)
+    else:
+        raise ValueError(f'stop must be "free", "elbow" or a number, not {stop!r}')
+    limit: int = image.shape[2] - 1
+    if threshold is None:
+        limit = min(limit, image.shape[2] - max(1, int(round(image.shape[2] * min_keep))))
+    if max_paths is not None:
+        limit = min(limit, max_paths)
     pbar: tqdm = tqdm(total=limit, desc="carving", unit="path", disable=not verbose)
-    height: int = image.shape[1]
-    offsets: npt.NDArray[np.int64] = np.arange(-band, band + 1)
-    band_rows: npt.NDArray[np.int64] = np.repeat(np.arange(height), len(offsets))
     # variability is a property of the region, so compute it once and carve
     # it alongside the image instead of recomputing it every iteration
     sigma: npt.NDArray[np.float32] = variability_map(image, mad_radius, mad_stride)
-    denom: npt.NDArray[np.float32] = (sigma ** 2 + mad_floor ** 2).astype(np.float32)
-    dist: npt.NDArray[np.float32] = get_distance_matrix(image) / denom  # full compute once
-    while image.shape[2] > 1 and (max_paths is None or len(removed_paths) < max_paths):
-        cols, avg = find_min_path(dist, step_penalty)
-        if avg >= threshold:
+    inv_scale: npt.NDArray[np.float32] = (1.0 / np.sqrt(sigma ** 2 + mad_floor ** 2)).astype(np.float32)
+    while len(removed_paths) < limit:
+        cols, avg = find_min_path(image, inv_scale, step_penalty)
+        if threshold is not None and avg > threshold:
             break
         image = remove_path(image, cols)
-        dist = remove_path(dist, cols)
-        denom = remove_path(denom, cols)
-        # only pixels within +/- band columns of the removed path changed neighbors
-        band_cols: npt.NDArray[np.int64] = (
-            np.asarray(cols)[:, None] + offsets
-        ).clip(0, image.shape[2] - 1).ravel()
-        dist[band_rows, band_cols] = (
-            compute_distance_at(image, band_rows, band_cols) / denom[band_rows, band_cols]
-        )
+        inv_scale = remove_path(inv_scale, cols)
         removed_paths.append(cols)
         removed_avgs.append(avg)
         pbar.update(1)
         pbar.set_postfix(width=image.shape[2], avg=f"{avg:.3g}")
     pbar.close()
+
+    if threshold is None:
+        keep: int = find_elbow(removed_avgs)
+        if verbose:
+            print(f"elbow at path {keep} of {len(removed_paths)}; rewinding")
+        removed_paths, removed_avgs = removed_paths[:keep], removed_avgs[:keep]
+        # replaying recorded removals needs no path search, so it is quick
+        image = np.ascontiguousarray(original)
+        for cols in removed_paths:
+            image = remove_path(image, cols)
     return image, removed_paths, removed_avgs
 
 
 def carve_rows(
     image: npt.NDArray[np.float32],
-    threshold: float,
+    stop: str | float = "free",
     max_paths: int | None = None,
     verbose: bool = True,
-    band: int = 3,
     mad_radius: int = 7,
     mad_stride: int = 4,
     mad_floor: float = 1 / 256,
     step_penalty: float = 0.0,
+    min_keep: float = 0.25,
 ) -> tuple[npt.NDArray[np.float32], list[list[int]], list[float]]:
     """Same as carve, but removes left-to-right paths (one row per column,
     each step moves row by -1/0/+1), shrinking the height.
@@ -320,8 +368,8 @@ def carve_rows(
     """
     transposed: npt.NDArray[np.float32] = image.transpose(0, 2, 1)  # (3, W, H)
     carved_t, removed_paths, removed_avgs = carve(
-        transposed, threshold, max_paths, verbose, band, mad_radius, mad_stride, mad_floor,
-        step_penalty,
+        transposed, stop, max_paths, verbose, mad_radius, mad_stride, mad_floor,
+        step_penalty, min_keep,
     )
     carved: npt.NDArray[np.float32] = carved_t.transpose(0, 2, 1)   # back to (3, H', W)
     return carved, removed_paths, removed_avgs
@@ -333,17 +381,58 @@ def save_image(image: npt.NDArray[np.float32], path: str) -> None:
     Image.fromarray(hwc).save(path)
 
 
+def removed_mask(
+    shape: tuple[int, int],
+    col_paths: list[list[int]],
+    row_paths: list[list[int]],
+) -> npt.NDArray[np.bool_]:
+    """Map the paths removed by carve (col_paths) and then carve_rows
+    (row_paths) back onto the original image. Returns an (H, W) boolean mask
+    that is True for every original pixel that was carved away.
+
+    Each path is stored in the coordinates of the image at the moment it was
+    removed, so we replay the removals on two index maps that remember each
+    surviving pixel's original row and column.
+    """
+    height, width = shape
+    orig_r: npt.NDArray[np.int32] = np.repeat(np.arange(height, dtype=np.int32)[:, None], width, axis=1)
+    orig_c: npt.NDArray[np.int32] = np.repeat(np.arange(width, dtype=np.int32)[None, :], height, axis=0)
+    mask: npt.NDArray[np.bool_] = np.zeros(shape, dtype=np.bool_)
+    for cols in col_paths:
+        rows_idx: npt.NDArray[np.int64] = np.arange(len(cols))
+        mask[orig_r[rows_idx, cols], orig_c[rows_idx, cols]] = True
+        orig_r, orig_c = remove_path(orig_r, cols), remove_path(orig_c, cols)
+    # carve_rows works on the transposed image, so replay on transposed maps
+    orig_r, orig_c = orig_r.T, orig_c.T
+    for rows in row_paths:
+        cols_idx: npt.NDArray[np.int64] = np.arange(len(rows))
+        mask[orig_r[cols_idx, rows], orig_c[cols_idx, rows]] = True
+        orig_r, orig_c = remove_path(orig_r, rows), remove_path(orig_c, rows)
+    return mask
+
+
+def grey_out(image: npt.NDArray[np.float32], mask: npt.NDArray[np.bool_], grey: float = 0.5) -> npt.NDArray[np.float32]:
+    """Return a copy of a (3, H, W) image with the masked pixels set to flat grey."""
+    out: npt.NDArray[np.float32] = image.copy()
+    out[:, mask] = grey
+    return out
+
+
 if __name__ == "__main__":
     arr: npt.NDArray[np.float32] = load_image("IMG_6081.png")
-    THRESHOLD=1
     print(f"original: {arr.shape}")
-    carved, removed, avgs = carve(arr, threshold=THRESHOLD)
-    print(f"removed {len(removed)} column paths -> {carved.shape}")
+    # each pass removes paths until the cheapest one is no longer free
+    carved, col_removed, avgs = carve(arr, stop=0.05)
+    print(f"removed {len(col_removed)} column paths -> {carved.shape}")
     if avgs:
-        print(f"avg distance of removed paths: first {avgs[0]:.3g}, last {avgs[-1]:.3g}")
-    carved, removed, avgs = carve_rows(carved, threshold=THRESHOLD)
-    print(f"removed {len(removed)} row paths -> {carved.shape}")
+        print(f"avg cost of removed paths: first {avgs[0]:.3g}, last {avgs[-1]:.3g}")
+    carved, row_removed, avgs = carve_rows(carved, stop=0.05)
+    print(f"removed {len(row_removed)} row paths -> {carved.shape}")
     if avgs:
-        print(f"avg distance of removed paths: first {avgs[0]:.3g}, last {avgs[-1]:.3g}")
+        print(f"avg cost of removed paths: first {avgs[0]:.3g}, last {avgs[-1]:.3g}")
     save_image(carved, "carved.png")
     print("saved carved.png")
+    mask = removed_mask(arr.shape[1:], col_removed, row_removed)
+    print(f"{int(mask.sum())} pixels removed ({mask.mean():.1%} of the original)")
+    save_image(grey_out(arr, mask), "removed.png")
+    print("saved removed.png")
