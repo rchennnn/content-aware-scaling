@@ -1,0 +1,19 @@
+# Python bytecode and Numba cache
+__pycache__/
+*.py[cod]
+*.nbi
+*.nbc
+
+# Virtual environments
+.venv/
+venv/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
