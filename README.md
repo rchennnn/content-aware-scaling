@@ -11,6 +11,8 @@ This project is a small, from-scratch implementation of seam carving, the techni
 
 Looking at the two images above, it is fair to wonder whether the carver did anything cleverer than crop the frame. The clearest way to check is to look directly at what was taken out. As the carver works, it records every path it removes, and once it finishes those paths are mapped back onto the original photograph and painted flat grey. Thus the carver functions as a "compressor". It removes pixels in a pathwise fashion and shrinks the image down.
 
+The tree, water, and sky all have redundant pixels, that is if we remove them, a viewer would hardly notice. Also buildings have redundant pixels if they display a monochrome and mono-texture wall as we can see in Bedřich Smetana Museum, Lichtenštejnský palác, and bits of Pražský hrad and Karlův most.
+
 ![Removed pixels greyed out on the original image](removed.png)
 
 In this run the carver removed 611 vertical paths and 1,439 horizontal ones, which together account for a little over half of the original pixels, and they are spread across the whole frame rather than taken from its edges. Most of the sky is gone, and the river is covered in a fine net of removed paths, because joins between ripples look just like more ripples. The paths flow around the floating log rather than through it, and they leave the bridge, the castle, and the reflection of the building on the right almost untouched, slipping past the city only through the trees and the willow where a gap costs little. Running `uv run python parse_image.py` writes both `carved.png` and `removed.png`.
